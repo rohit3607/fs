@@ -223,83 +223,80 @@ async def start_command(client: Client, message: Message):
 
 # Create a global dictionary to store chat data
 chat_data_cache = {}
-
 async def not_joined(client: Client, message: Message):
     temp = await message.reply("<b><i>Checking Subscription...</i></b>")
-
     user_id = message.from_user.id
     buttons = []
-    count = 0
 
     try:
-        all_channels = await db.show_channels()  # Should return list of (chat_id, mode) tuples
-        for total, chat_id in enumerate(all_channels, start=1):
-            mode = await db.get_channel_mode(chat_id)  # fetch mode 
+        # Get all channels in one go
+        all_channels = await db.show_channels()  # [(chat_id, mode), ...] ideally
+        # Preload channel modes in parallel
+        modes = await asyncio.gather(*(db.get_channel_mode(chat_id) for chat_id in all_channels))
 
-            await message.reply_chat_action(ChatAction.TYPING)
+        # Fetch chat info in parallel (using cache if possible)
+        chats_data = []
+        for idx, chat_id in enumerate(all_channels):
+            if chat_id in chat_data_cache:
+                chats_data.append((chat_data_cache[chat_id], modes[idx]))
+            else:
+                chats_data.append((chat_id, modes[idx]))
 
-            if not await is_sub(client, user_id, chat_id):
-                try:
-                    # Cache chat info
-                    if chat_id in chat_data_cache:
-                        data = chat_data_cache[chat_id]
-                    else:
-                        data = await client.get_chat(chat_id)
-                        chat_data_cache[chat_id] = data
+        # Now get chats from API only for uncached ones in parallel
+        uncached = [(i, chat_id) for i, (chat_id, _) in enumerate(chats_data) if isinstance(chat_id, int)]
+        if uncached:
+            fetched = await asyncio.gather(*(client.get_chat(chat_id) for _, chat_id in uncached))
+            for (i, chat_id), data in zip(uncached, fetched):
+                chat_data_cache[chat_id] = data
+                chats_data[i] = (data, chats_data[i][1])
 
-                    name = data.title
+        # Check subscription for all channels in parallel
+        results = await asyncio.gather(*(is_sub(client, user_id, data.id) for data, _ in chats_data))
 
-                    # Generate proper invite link based on the mode
-                    if mode == "on" and not data.username:
-                        invite = await client.create_chat_invite_link(
-                            chat_id=chat_id,
-                            creates_join_request=True,
-                            expire_date=datetime.utcnow() + timedelta(seconds=FSUB_LINK_EXPIRY) if FSUB_LINK_EXPIRY else None
-                            )
-                        link = invite.invite_link
-
-                    else:
-                        if data.username:
-                            link = f"https://t.me/{data.username}"
-                        else:
-                            invite = await client.create_chat_invite_link(
-                                chat_id=chat_id,
-                                expire_date=datetime.utcnow() + timedelta(seconds=FSUB_LINK_EXPIRY) if FSUB_LINK_EXPIRY else None)
-                            link = invite.invite_link
-
-                    buttons.append([InlineKeyboardButton(text=name, url=link)])
-                    count += 1
-                    await temp.edit(f"<b>{'! ' * count}</b>")
-
-                except Exception as e:
-                    print(f"Error with chat {chat_id}: {e}")
-                    return await temp.edit(
-                        f"<b><i>! Eʀʀᴏʀ, Cᴏɴᴛᴀᴄᴛ ᴅᴇᴠᴇʟᴏᴘᴇʀ ᴛᴏ sᴏʟᴠᴇ ᴛʜᴇ ɪssᴜᴇs @rohit_1888</i></b>\n"
-                        f"<blockquote expandable><b>Rᴇᴀsᴏɴ:</b> {e}</blockquote>"
+        for (data, mode), is_joined in zip(chats_data, results):
+            if not is_joined:
+                # Generate link
+                if mode == "on" and not data.username:
+                    invite = await client.create_chat_invite_link(
+                        chat_id=data.id,
+                        creates_join_request=True,
+                        expire_date=datetime.utcnow() + timedelta(seconds=FSUB_LINK_EXPIRY) if FSUB_LINK_EXPIRY else None
                     )
+                    link = invite.invite_link
+                else:
+                    if data.username:
+                        link = f"https://t.me/{data.username}"
+                    else:
+                        invite = await client.create_chat_invite_link(
+                            chat_id=data.id,
+                            expire_date=datetime.utcnow() + timedelta(seconds=FSUB_LINK_EXPIRY) if FSUB_LINK_EXPIRY else None
+                        )
+                        link = invite.invite_link
+                buttons.append([InlineKeyboardButton(text=data.title, url=link)])
 
-        # Retry Button
-        try:
-            buttons.append([
-                InlineKeyboardButton(
-                    text='♻️ Tʀʏ Aɢᴀɪɴ',
-                    url=f"https://t.me/{client.username}?start={message.command[1]}"
-                )
-            ])
-        except IndexError:
-            pass
+        if buttons:
+            try:
+                buttons.append([
+                    InlineKeyboardButton(
+                        text='♻️ Tʀʏ Aɢᴀɪɴ',
+                        url=f"https://t.me/{client.username}?start={message.command[1]}"
+                    )
+                ])
+            except IndexError:
+                pass
 
-        await message.reply_photo(
-            photo=FORCE_PIC,
-            caption=FORCE_MSG.format(
-                first=message.from_user.first_name,
-                last=message.from_user.last_name,
-                username=None if not message.from_user.username else '@' + message.from_user.username,
-                mention=message.from_user.mention,
-                id=message.from_user.id
-            ),
-            reply_markup=InlineKeyboardMarkup(buttons),
-        )
+            await message.reply_photo(
+                photo=FORCE_PIC,
+                caption=FORCE_MSG.format(
+                    first=message.from_user.first_name,
+                    last=message.from_user.last_name,
+                    username=None if not message.from_user.username else '@' + message.from_user.username,
+                    mention=message.from_user.mention,
+                    id=message.from_user.id
+                ),
+                reply_markup=InlineKeyboardMarkup(buttons)
+            )
+        await temp.delete()
 
     except Exception as e:
         print(f"Final Error: {e}")
