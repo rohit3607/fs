@@ -222,13 +222,11 @@ async def start_command(client: Client, message: Message):
 
 
 
-# Global cache for chat data
 chat_data_cache = {}
-# Global storage for active invites to revoke later
 active_invites = {}
 
 async def generate_temp_invite(client, chat_id, mode):
-    """Generate a temporary invite link that will be revoked after FSUB_LINK_EXPIRY seconds."""
+    """Generate a temporary invite link that will be revoked after FSUB_LINK_EXPIRY seconds using Telegram's own timestamp."""
     if mode == "on":
         invite = await client.create_chat_invite_link(
             chat_id=chat_id,
@@ -237,12 +235,16 @@ async def generate_temp_invite(client, chat_id, mode):
     else:
         invite = await client.create_chat_invite_link(chat_id=chat_id)
 
-    # Save in active list
-    active_invites[invite.invite_link] = (chat_id, time.time())
+    # Use Telegram's date field instead of local time
+    created_at = invite.date.timestamp()
+    expire_at = created_at + FSUB_LINK_EXPIRY
 
-    # Auto revoke after expiry
+    active_invites[invite.invite_link] = (chat_id, expire_at)
+
     async def auto_revoke():
-        await asyncio.sleep(FSUB_LINK_EXPIRY)
+        now = time.time()
+        delay = max(0, expire_at - now)  # Prevent negative wait
+        await asyncio.sleep(delay)
         try:
             await client.revoke_chat_invite_link(chat_id=chat_id, invite_link=invite.invite_link)
             active_invites.pop(invite.invite_link, None)
@@ -260,13 +262,9 @@ async def not_joined(client: Client, message: Message):
     buttons = []
 
     try:
-        # Get all channels in one go
-        all_channels = await db.show_channels()  # [(chat_id, mode), ...] ideally
-
-        # Preload channel modes in parallel
+        all_channels = await db.show_channels()
         modes = await asyncio.gather(*(db.get_channel_mode(chat_id) for chat_id in all_channels))
 
-        # Fetch chat info (use cache if possible)
         chats_data = []
         for idx, chat_id in enumerate(all_channels):
             if chat_id in chat_data_cache:
@@ -274,7 +272,6 @@ async def not_joined(client: Client, message: Message):
             else:
                 chats_data.append((chat_id, modes[idx]))
 
-        # Fetch uncached chat info in parallel
         uncached = [(i, chat_id) for i, (chat_id, _) in enumerate(chats_data) if isinstance(chat_id, int)]
         if uncached:
             fetched = await asyncio.gather(*(client.get_chat(chat_id) for _, chat_id in uncached))
@@ -282,12 +279,10 @@ async def not_joined(client: Client, message: Message):
                 chat_data_cache[chat_id] = data
                 chats_data[i] = (data, chats_data[i][1])
 
-        # Check subscription in parallel
         results = await asyncio.gather(*(is_sub(client, user_id, data.id) for data, _ in chats_data))
 
         for (data, mode), is_joined in zip(chats_data, results):
             if not is_joined:
-                # Generate temp invite link that expires in FSUB_LINK_EXPIRY
                 link = await generate_temp_invite(client, data.id, mode)
                 buttons.append([InlineKeyboardButton(text=data.title, url=link)])
 
