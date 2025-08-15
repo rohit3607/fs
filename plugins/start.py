@@ -33,7 +33,7 @@ from database.db_premium import *
 
 BAN_SUPPORT = f"{BAN_SUPPORT}"
 TUT_VID = f"{TUT_VID}"
-FSUB_LINK_EXPIRY = f"{FSUB_LINK_EXPIRY}"
+#FSUB_LINK_EXPIRY = f"{FSUB_LINK_EXPIRY}"
 
 @Bot.on_message(filters.command('start') & filters.private)
 async def start_command(client: Client, message: Message):
@@ -222,8 +222,38 @@ async def start_command(client: Client, message: Message):
 
 
 
-# Create a global dictionary to store chat data
+# Global cache for chat data
 chat_data_cache = {}
+# Global storage for active invites to revoke later
+active_invites = {}
+
+async def generate_temp_invite(client, chat_id, mode):
+    """Generate a temporary invite link that will be revoked after FSUB_LINK_EXPIRY seconds."""
+    if mode == "on":
+        invite = await client.create_chat_invite_link(
+            chat_id=chat_id,
+            creates_join_request=True
+        )
+    else:
+        invite = await client.create_chat_invite_link(chat_id=chat_id)
+
+    # Save in active list
+    active_invites[invite.invite_link] = (chat_id, time.time())
+
+    # Auto revoke after expiry
+    async def auto_revoke():
+        await asyncio.sleep(FSUB_LINK_EXPIRY)
+        try:
+            await client.revoke_chat_invite_link(chat_id=chat_id, invite_link=invite.invite_link)
+            active_invites.pop(invite.invite_link, None)
+        except Exception as e:
+            print(f"Failed to revoke invite: {e}")
+
+    asyncio.create_task(auto_revoke())
+
+    return invite.invite_link
+
+
 async def not_joined(client: Client, message: Message):
     temp = await message.reply("<b><i>Checking Subscription...</i></b>")
     user_id = message.from_user.id
@@ -232,10 +262,11 @@ async def not_joined(client: Client, message: Message):
     try:
         # Get all channels in one go
         all_channels = await db.show_channels()  # [(chat_id, mode), ...] ideally
+
         # Preload channel modes in parallel
         modes = await asyncio.gather(*(db.get_channel_mode(chat_id) for chat_id in all_channels))
 
-        # Fetch chat info in parallel (using cache if possible)
+        # Fetch chat info (use cache if possible)
         chats_data = []
         for idx, chat_id in enumerate(all_channels):
             if chat_id in chat_data_cache:
@@ -243,7 +274,7 @@ async def not_joined(client: Client, message: Message):
             else:
                 chats_data.append((chat_id, modes[idx]))
 
-        # Now get chats from API only for uncached ones in parallel
+        # Fetch uncached chat info in parallel
         uncached = [(i, chat_id) for i, (chat_id, _) in enumerate(chats_data) if isinstance(chat_id, int)]
         if uncached:
             fetched = await asyncio.gather(*(client.get_chat(chat_id) for _, chat_id in uncached))
@@ -251,28 +282,13 @@ async def not_joined(client: Client, message: Message):
                 chat_data_cache[chat_id] = data
                 chats_data[i] = (data, chats_data[i][1])
 
-        # Check subscription for all channels in parallel
+        # Check subscription in parallel
         results = await asyncio.gather(*(is_sub(client, user_id, data.id) for data, _ in chats_data))
 
         for (data, mode), is_joined in zip(chats_data, results):
             if not is_joined:
-                # Generate link
-                if mode == "on" and not data.username:
-                    invite = await client.create_chat_invite_link(
-                        chat_id=data.id,
-                        creates_join_request=True,
-                        expire_date=datetime.utcnow() + timedelta(seconds=FSUB_LINK_EXPIRY) if FSUB_LINK_EXPIRY else None
-                    )
-                    link = invite.invite_link
-                else:
-                    if data.username:
-                        link = f"https://t.me/{data.username}"
-                    else:
-                        invite = await client.create_chat_invite_link(
-                            chat_id=data.id,
-                            expire_date=datetime.utcnow() + timedelta(seconds=FSUB_LINK_EXPIRY) if FSUB_LINK_EXPIRY else None
-                        )
-                        link = invite.invite_link
+                # Generate temp invite link that expires in FSUB_LINK_EXPIRY
+                link = await generate_temp_invite(client, data.id, mode)
                 buttons.append([InlineKeyboardButton(text=data.title, url=link)])
 
         if buttons:
