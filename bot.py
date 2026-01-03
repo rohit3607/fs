@@ -42,6 +42,12 @@ async def root_route_handler(request):
     return web.json_response("Codeflix FileStore")
 
 
+async def web_server():
+    web_app = web.Application(client_max_size=30000000)
+    web_app.add_routes(routes)
+    return web_app
+
+
 def get_indian_time():
     """Returns the current time in IST."""
     ist = pytz.timezone("Asia/Kolkata")
