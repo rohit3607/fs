@@ -4,7 +4,6 @@ pyrofork==2.3.61
 TgCrypto
 pyromod==1.5
 schedule
-APscheduler
 # --- For-Database ------------ #
 pymongo
 motor
