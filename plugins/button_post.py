@@ -86,15 +86,15 @@ async def cb_handler(client, cb):
     if data == "create_post":
         await cb.answer()
         if not is_admin(uid):
-            await cb.message.answer_text("Only bot owner or admins can create posts.")
+            await cb.message.reply_text("Only bot owner or admins can create posts.")
             return
         DRAFTS[uid] = {'messages': [], 'url_buttons': [], 'reactions': [], 'target': None}
-        await cb.message.answer_text("Send me the message (text, media or album) you want to post. Send /cancel to abort.")
+        await cb.message.reply_text("Send me the message (text, media or album) you want to post. Send /cancel to abort.")
         try:
             msg = await client.listen(cb.message.chat.id, timeout=300)
         except asyncio.TimeoutError:
             DRAFTS.pop(uid, None)
-            await cb.message.answer_text("Timed out. Please start creating the post again.")
+            await cb.message.reply_text("Timed out. Please start creating the post again.")
             return
 
         if msg.text and msg.text.lower() == "/cancel":
@@ -140,7 +140,7 @@ async def cb_handler(client, cb):
         try:
             msg = await client.listen(cb.message.chat.id, timeout=300)
         except asyncio.TimeoutError:
-            await cb.message.answer_text("Timed out. Returning to menu.")
+            await cb.message.reply_text("Timed out. Returning to menu.")
             return
         if msg.text and msg.text.lower() == "/cancel":
             await msg.reply_text("Cancelled adding buttons.")
@@ -162,7 +162,7 @@ async def cb_handler(client, cb):
         try:
             msg = await client.listen(cb.message.chat.id, timeout=300)
         except asyncio.TimeoutError:
-            await cb.message.answer_text("Timed out. Returning to menu.")
+            await cb.message.reply_text("Timed out. Returning to menu.")
             return
         if msg.text and msg.text.lower() == "/cancel":
             await msg.reply_text("Cancelled adding reactions.")
@@ -215,7 +215,7 @@ async def cb_handler(client, cb):
         try:
             ch = await client.listen(cb.message.chat.id, timeout=300)
         except asyncio.TimeoutError:
-            await cb.message.answer_text("Timed out. Post aborted.")
+            await cb.message.reply_text("Timed out. Post aborted.")
             return
         if ch.text and ch.text.lower() == "/cancel":
             await ch.reply_text("Cancelled.")
