@@ -44,6 +44,51 @@ def parse_reactions(text: str):
     return emojis
 
 
+async def send_draft_menu(client, chat_id: int, uid: int):
+    """Send or update an interactive draft menu to the admin with edit/remove options."""
+    draft = DRAFTS.get(uid)
+    if not draft:
+        await client.send_message(chat_id, "No active draft.")
+        return
+
+    # Build control keyboard
+    ctrl_kb = []
+    # URL controls
+    ctrl_kb.append([
+        InlineKeyboardButton("Edit URL Buttons", callback_data=f"edit_url|{uid}"),
+        InlineKeyboardButton("Remove URL Buttons", callback_data=f"remove_url|{uid}")
+    ])
+    # Reaction controls
+    ctrl_kb.append([
+        InlineKeyboardButton("Edit Reactions", callback_data=f"edit_react|{uid}"),
+        InlineKeyboardButton("Remove Reactions", callback_data=f"remove_react|{uid}")
+    ])
+    # Preview / Post
+    ctrl_kb.append([
+        InlineKeyboardButton("Preview", callback_data=f"preview_draft|{uid}"),
+        InlineKeyboardButton("Post (Choose Channel)", callback_data=f"choose_channel|{uid}")
+    ])
+    ctrl_kb.append([InlineKeyboardButton("Cancel", callback_data=f"cancel_post|{uid}")])
+
+    kb = InlineKeyboardMarkup(ctrl_kb)
+
+    # send a preview copy of the first draft message (if exists)
+    if draft['messages']:
+        first = draft['messages'][0]
+        try:
+            await client.copy_message(chat_id=chat_id, from_chat_id=first.chat.id, message_id=first.message_id, reply_markup=kb)
+        except Exception:
+            # fallback: send a short summary
+            text = "Draft saved. Use the buttons below to edit or post."
+            if draft.get('url_buttons'):
+                text += f"\nURL buttons: {sum(len(r) for r in draft['url_buttons'])}"
+            if draft.get('reactions'):
+                text += f"\nReactions: {' '.join(draft['reactions'])}"
+            await client.send_message(chat_id, text, reply_markup=kb)
+    else:
+        await client.send_message(chat_id, "Draft saved. Use the buttons below to edit or post.", reply_markup=kb)
+
+
 @Client.on_message(filters.private & filters.command("start"))
 async def start_cmd(client, message):
     mention = message.from_user.mention if message.from_user else "user"
@@ -126,6 +171,13 @@ async def cb_handler(client, cb):
         return
 
     if data == "cancel_post":
+        # support cancel coming from menu with |uid suffix
+        if "|" in data:
+            # example 'cancel_post|<uid>'
+            DRAFTS.pop(uid, None)
+            await cb.answer("Cancelled")
+            await cb.message.edit_text("Draft cancelled.")
+            return
         DRAFTS.pop(uid, None)
         await cb.answer("Cancelled")
         await cb.message.edit_text("Draft cancelled.")
@@ -133,6 +185,10 @@ async def cb_handler(client, cb):
 
     if data == "add_url":
         await cb.answer()
+        # support callback that may include uid suffix
+        if "|" in data:
+            _, _uid = data.split("|", 1)
+            uid = int(_uid)
         if uid not in DRAFTS:
             await cb.message.reply_text("No active draft. Start with Create Post.")
             return
@@ -151,10 +207,15 @@ async def cb_handler(client, cb):
             return
         DRAFTS[uid]['url_buttons'] = rows
         await msg.reply_text("URL buttons saved.")
+        await send_draft_menu(client, cb.message.chat.id, uid)
         return
 
     if data == "add_react":
         await cb.answer()
+        # support callback with uid suffix
+        if "|" in data:
+            _, _uid = data.split("|", 1)
+            uid = int(_uid)
         if uid not in DRAFTS:
             await cb.message.reply_text("No active draft. Start with Create Post.")
             return
@@ -173,10 +234,15 @@ async def cb_handler(client, cb):
             return
         DRAFTS[uid]['reactions'] = emojis
         await msg.reply_text(f"Added {len(emojis)} reaction(s): {' '.join(emojis)}")
+        await send_draft_menu(client, cb.message.chat.id, uid)
         return
 
-    if data == "preview":
+    if data == "preview" or data.startswith("preview_draft"):
         await cb.answer()
+        # allow callback with |uid suffix
+        if "|" in data:
+            _, _uid = data.split("|", 1)
+            uid = int(_uid)
         if uid not in DRAFTS:
             await cb.message.reply_text("No active draft.")
             return
@@ -206,7 +272,57 @@ async def cb_handler(client, cb):
         await cb.message.reply_text("This is a preview. Use Post to publish or add more buttons.")
         return
 
+    async def post_draft_to_target(client, uid, target_id, reply_chat_id):
+        """Helper to post a draft to a target channel id and notify the requester."""
+        if uid not in DRAFTS:
+            await client.send_message(reply_chat_id, "No active draft.")
+            return
+        draft = DRAFTS[uid]
+        keyboard = []
+        if draft.get('url_buttons'):
+            keyboard.extend(draft['url_buttons'])
+        kb = InlineKeyboardMarkup(keyboard) if keyboard else None
+
+        posted_msg_id = None
+        first = True
+        for m in draft['messages']:
+            try:
+                if first:
+                    sent = await client.copy_message(chat_id=target_id, from_chat_id=m.chat.id, message_id=m.message_id, reply_markup=kb)
+                    posted_msg_id = sent.message_id
+                    first = False
+                else:
+                    await client.copy_message(chat_id=target_id, from_chat_id=m.chat.id, message_id=m.message_id)
+            except Exception as e:
+                await client.send_message(reply_chat_id, f"Failed to post message: {e}")
+                return
+
+        if draft.get('reactions') and posted_msg_id:
+            try:
+                current_kb = []
+                if draft.get('url_buttons'):
+                    current_kb.extend(draft['url_buttons'])
+                row = []
+                for e in draft['reactions']:
+                    b = e.encode('utf-8').hex()
+                    cbdata = f"react|{target_id}|{posted_msg_id}|{b}"
+                    row.append(InlineKeyboardButton(f"{e} 0", callback_data=cbdata))
+                current_kb.append(row)
+                await client.edit_message_reply_markup(target_id, posted_msg_id, reply_markup=InlineKeyboardMarkup(current_kb))
+            except Exception:
+                pass
+
+        # persist post metadata
+        try:
+            await db.save_post(target_id, posted_msg_id, emoji_order=draft.get('reactions'))
+        except Exception:
+            pass
+
+        await client.send_message(reply_chat_id, "Posted successfully.")
+        DRAFTS.pop(uid, None)
+
     if data == "post_now":
+        # legacy path: keep for backward compatibility
         await cb.answer()
         if uid not in DRAFTS:
             await cb.message.reply_text("No active draft.")
@@ -221,53 +337,239 @@ async def cb_handler(client, cb):
             await ch.reply_text("Cancelled.")
             return
         channel = ch.text.strip()
+        # try to resolve chat
         try:
             target = await client.get_chat(channel)
-        except Exception:
+        except Exception as e:
             await ch.reply_text("Could not find that channel. Make sure I am in the channel and provided the correct username or ID.")
             return
+        # check bot privileges (robust check)
         try:
             member = await client.get_chat_member(target.id, (await client.get_me()).id)
-            if member.status not in ("administrator", "creator"):
+            if not (str(member.status).lower() in ("administrator", "creator") or getattr(member, 'can_post_messages', False)):
                 await ch.reply_text("I am not an admin in that channel. Please make me admin (with right to post/edit) and try again.")
                 return
         except Exception:
             pass
 
-        draft = DRAFTS[uid]
-        keyboard = []
-        if draft['url_buttons']:
-            keyboard.extend(draft['url_buttons'])
-        kb = InlineKeyboardMarkup(keyboard) if keyboard else None
+        # delegate to shared poster routine
+        await post_draft_to_target(client, uid, target.id, cb.message.chat.id)
+        return
 
-        posted_msg_id = None
-        first = True
-        for m in draft['messages']:
+    if data.startswith("choose_channel"):
+        await cb.answer()
+        # data may be 'choose_channel' or 'choose_channel|<uid>'
+        if "|" in data:
+            _, _uid = data.split("|", 1)
+            uid = int(_uid)
+        # list configured channels
+        channels = await db.list_channels()
+        if not channels:
+            await cb.message.reply_text("No configured channels. Use /add_channel first or specify a channel id manually with 'Post Now' option.")
+            return
+        rows = []
+        for c in channels:
+            ch_id = c.get('_id')
+            # try to fetch a friendly label
+            label = str(ch_id)
             try:
-                if first:
-                    sent = await client.copy_message(chat_id=target.id, from_chat_id=m.chat.id, message_id=m.message_id, reply_markup=kb)
-                    posted_msg_id = sent.message_id
-                    first = False
-                else:
-                    await client.copy_message(chat_id=target.id, from_chat_id=m.chat.id, message_id=m.message_id)
-            except Exception as e:
-                await ch.reply_text(f"Failed to post message: {e}")
-                return
-
-        if draft['reactions'] and posted_msg_id:
-            try:
-                current_kb = []
-                if draft['url_buttons']:
-                    current_kb.extend(draft['url_buttons'])
-                row = []
-                for e in draft['reactions']:
-                    b = e.encode('utf-8').hex()
-                    cbdata = f"react|{target.id}|{posted_msg_id}|{b}"
-                    row.append(InlineKeyboardButton(f"{e} 0", callback_data=cbdata))
-                current_kb.append(row)
-                await client.edit_message_reply_markup(target.id, posted_msg_id, reply_markup=InlineKeyboardMarkup(current_kb))
+                chinfo = await client.get_chat(ch_id)
+                label = chinfo.title or chinfo.username or str(ch_id)
             except Exception:
                 pass
+            rows.append([InlineKeyboardButton(label, callback_data=f"post_to|{uid}|{ch_id}")])
+        rows.append([InlineKeyboardButton("Custom channel (enter id)", callback_data=f"post_custom|{uid}")])
+        rows.append([InlineKeyboardButton("Back", callback_data=f"preview_draft|{uid}")])
+        await cb.message.reply_text("Choose channel:", reply_markup=InlineKeyboardMarkup(rows))
+        return
+
+    if data.startswith("post_to|"):
+        await cb.answer()
+        # format: post_to|<uid>|<ch_id>
+        try:
+            _, _uid, ch_id = data.split("|", 2)
+            uid = int(_uid)
+            ch_id = int(ch_id)
+        except Exception:
+            await cb.message.reply_text("Invalid channel selection.")
+            return
+        # check bot privileges
+        try:
+            member = await client.get_chat_member(ch_id, (await client.get_me()).id)
+            if not (str(member.status).lower() in ("administrator", "creator") or getattr(member, 'can_post_messages', False)):
+                await cb.message.reply_text("I am not an admin in that channel. Please make me admin (with right to post/edit) and try again.")
+                return
+        except Exception:
+            await cb.message.reply_text("Could not verify admin status. Make sure I am a member/admin in that channel.")
+            return
+        # proceed to post
+        await post_draft_to_target(client, uid, ch_id, cb.message.chat.id)
+        return
+
+    if data.startswith("post_custom|"):
+        await cb.answer()
+        _, _uid = data.split("|", 1)
+        uid = int(_uid)
+        await cb.message.reply_text("Send the channel username (eg @channelusername) or channel ID (eg -10012345) where I should post. I must be admin in that channel.")
+        try:
+            ch = await client.listen(cb.message.chat.id, timeout=300)
+        except asyncio.TimeoutError:
+            await cb.message.reply_text("Timed out. Post aborted.")
+            return
+        if ch.text and ch.text.lower() == "/cancel":
+            await ch.reply_text("Cancelled.")
+            return
+        try:
+            target = await client.get_chat(ch.text.strip())
+            ch_id = target.id
+        except Exception:
+            await ch.reply_text("Could not find that channel. Make sure I am in the channel and provided the correct username or ID.")
+            return
+        # verify admin
+        try:
+            member = await client.get_chat_member(ch_id, (await client.get_me()).id)
+            if not (str(member.status).lower() in ("administrator", "creator") or getattr(member, 'can_post_messages', False)):
+                await ch.reply_text("I am not an admin in that channel. Please make me admin (with right to post/edit) and try again.")
+                return
+        except Exception:
+            pass
+        await post_draft_to_target(client, uid, ch_id, cb.message.chat.id)
+        return
+
+    if data.startswith("edit_url|") or data.startswith("edit_url"):
+        await cb.answer()
+        if "|" in data:
+            _, _uid = data.split("|",1)
+            uid = int(_uid)
+        if uid not in DRAFTS:
+            await cb.message.reply_text("No active draft.")
+            return
+        await cb.message.reply_text("Send me a list of URL buttons (Label - URL | Label2 - URL2). Send /cancel to abort.")
+        try:
+            msg = await client.listen(cb.message.chat.id, timeout=300)
+        except asyncio.TimeoutError:
+            await cb.message.reply_text("Timed out.")
+            return
+        if msg.text and msg.text.lower() == "/cancel":
+            await msg.reply_text("Cancelled.")
+            return
+        rows = parse_url_buttons(msg.text)
+        if not rows:
+            await msg.reply_text("Could not parse any buttons. No changes made.")
+            return
+        DRAFTS[uid]['url_buttons'] = rows
+        await msg.reply_text("URL buttons updated.")
+        await send_draft_menu(client, cb.message.chat.id, uid)
+        return
+
+    if data.startswith("remove_url|") or data == "remove_url":
+        await cb.answer()
+        if "|" in data:
+            _, _uid = data.split("|",1)
+            uid = int(_uid)
+        if uid in DRAFTS:
+            DRAFTS[uid]['url_buttons'] = []
+        await cb.message.reply_text("URL buttons removed.")
+        await send_draft_menu(client, cb.message.chat.id, uid)
+        return
+
+    if data.startswith("edit_react|") or data == "edit_react":
+        await cb.answer()
+        if "|" in data:
+            _, _uid = data.split("|",1)
+            uid = int(_uid)
+        if uid not in DRAFTS:
+            await cb.message.reply_text("No active draft.")
+            return
+        await cb.message.reply_text("Send emojis (space separated) to set reaction buttons. Send /cancel to abort.")
+        try:
+            msg = await client.listen(cb.message.chat.id, timeout=300)
+        except asyncio.TimeoutError:
+            await cb.message.reply_text("Timed out.")
+            return
+        if msg.text and msg.text.lower() == "/cancel":
+            await msg.reply_text("Cancelled.")
+            return
+        emojis = parse_reactions(msg.text)
+        if not emojis:
+            await msg.reply_text("No emojis detected. No changes made.")
+            return
+        DRAFTS[uid]['reactions'] = emojis
+        await msg.reply_text(f"Reactions updated: {' '.join(emojis)}")
+        await send_draft_menu(client, cb.message.chat.id, uid)
+        return
+
+    if data.startswith("remove_react|") or data == "remove_react":
+        await cb.answer()
+        if "|" in data:
+            _, _uid = data.split("|",1)
+            uid = int(_uid)
+        if uid in DRAFTS:
+            DRAFTS[uid]['reactions'] = []
+        await cb.message.reply_text("Removed reactions.")
+        await send_draft_menu(client, cb.message.chat.id, uid)
+        return
+
+    if data.startswith("react|"):
+        await cb.answer()
+        try:
+            _, ch_id_s, msg_id_s, emo_hex = data.split("|", 3)
+            ch_id = int(ch_id_s)
+            msg_id = int(msg_id_s)
+            emoji = bytes.fromhex(emo_hex).decode('utf-8')
+        except Exception:
+            await cb.answer("Invalid reaction data.")
+            return
+
+        # increment and fetch new count
+        try:
+            newcount = await db.increment_reaction(ch_id, msg_id, emoji)
+        except Exception:
+            newcount = None
+
+        # try to rebuild keyboard: preserve existing url buttons if any
+        try:
+            msg = await client.get_messages(ch_id, msg_id)
+            current_kb = []
+            if msg.reply_markup and getattr(msg.reply_markup, 'inline_keyboard', None):
+                # copy existing rows except possible old reaction row (we'll append a new reaction row)
+                for row in msg.reply_markup.inline_keyboard:
+                    # check if this row looks like reaction row by inspecting callback_data of first button
+                    is_react_row = False
+                    for btn in row:
+                        if getattr(btn, 'callback_data', None) and str(btn.callback_data).startswith('react|'):
+                            is_react_row = True
+                            break
+                    if not is_react_row:
+                        new_row = []
+                        for btn in row:
+                            # reconstruct original button (url or callback)
+                            if getattr(btn, 'url', None):
+                                new_row.append(InlineKeyboardButton(btn.text, url=btn.url))
+                            else:
+                                new_row.append(InlineKeyboardButton(btn.text, callback_data=btn.callback_data))
+                        current_kb.append(new_row)
+            else:
+                current_kb = []
+
+            # fetch post info to get emoji order and counts
+            post = await db.get_post(ch_id, msg_id)
+            emoji_order = post.get('emoji_order') if post else []
+            react_row = []
+            for e in emoji_order or [emoji]:
+                b = e.encode('utf-8').hex()
+                cnt = 0
+                if post and post.get('reactions'):
+                    cnt = post.get('reactions', {}).get(e, 0)
+                react_row.append(InlineKeyboardButton(f"{e} {cnt}", callback_data=f"react|{ch_id}|{msg_id}|{b}"))
+            if react_row:
+                current_kb.append(react_row)
+
+            await client.edit_message_reply_markup(ch_id, msg_id, reply_markup=InlineKeyboardMarkup(current_kb))
+        except Exception:
+            pass
+
+        return
 
 
 @Client.on_message(filters.private & filters.command("cmds"))
