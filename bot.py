@@ -24,6 +24,10 @@ from config import *
 from database.database import *
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import logging
+import pyrogram.utils
+
+pyrogram.utils.MIN_CHANNEL_ID = -1009147483647
+
 
 # Suppress APScheduler logs below WARNING level
 logging.getLogger("apscheduler").setLevel(logging.WARNING)
