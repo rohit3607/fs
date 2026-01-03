@@ -1,9 +1,55 @@
 from pyrogram import Client, filters
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto, InputMediaVideo, InputMediaDocument
 import asyncio
 import re
+import logging
+
+
+async def _attempt_send_preview(client, dest_chat_id, msg, reply_markup=None):
+    """Try to present a message to dest_chat: copy -> forward -> re-send by type."""
+    try:
+        # try copy first
+        return await client.copy_message(chat_id=dest_chat_id, from_chat_id=msg.chat.id, message_id=msg.message_id, reply_markup=reply_markup)
+    except Exception as e:
+        logger.debug("copy_message failed for preview: %s", e)
+    try:
+        return await client.forward_messages(dest_chat_id, msg.chat.id, msg.message_id)
+    except Exception as e:
+        logger.debug("forward_messages failed for preview: %s", e)
+    # fallback: try to re-send by type
+    try:
+        if msg.text:
+            return await client.send_message(dest_chat_id, msg.text, reply_markup=reply_markup)
+        if getattr(msg, 'photo', None):
+            fid = msg.photo[-1].file_id
+            return await client.send_photo(dest_chat_id, fid, caption=msg.caption or None, reply_markup=reply_markup)
+        if getattr(msg, 'video', None):
+            fid = msg.video.file_id
+            return await client.send_video(dest_chat_id, fid, caption=msg.caption or None, reply_markup=reply_markup)
+        if getattr(msg, 'document', None):
+            fid = msg.document.file_id
+            return await client.send_document(dest_chat_id, fid, caption=msg.caption or None, reply_markup=reply_markup)
+        if getattr(msg, 'animation', None):
+            fid = msg.animation.file_id
+            return await client.send_animation(dest_chat_id, fid, caption=msg.caption or None, reply_markup=reply_markup)
+        if getattr(msg, 'audio', None):
+            fid = msg.audio.file_id
+            return await client.send_audio(dest_chat_id, fid, caption=msg.caption or None, reply_markup=reply_markup)
+        if getattr(msg, 'voice', None):
+            fid = msg.voice.file_id
+            return await client.send_voice(dest_chat_id, fid, caption=msg.caption or None, reply_markup=reply_markup)
+        # sticker or other types: try sending as document
+        if getattr(msg, 'sticker', None):
+            fid = msg.sticker.file_id
+            return await client.send_sticker(dest_chat_id, fid)
+    except Exception as e:
+        logger.exception("Resend-by-type failed for preview: %s", e)
+    # give up
+    return None
 from config import START_MSG, START_PIC, HELP_TXT, ABOUT_TXT, is_admin
 from database.database import db
+
+logger = logging.getLogger(__name__)
 
 # ephemeral drafts keyed by user_id
 DRAFTS = {}
@@ -72,14 +118,21 @@ async def send_draft_menu(client, chat_id: int, uid: int):
 
     kb = InlineKeyboardMarkup(ctrl_kb)
 
-    # send a preview copy of the first draft message (if exists)
+    # send a preview of each draft message (if exists)
     if draft['messages']:
-        first = draft['messages'][0]
-        try:
-            await client.copy_message(chat_id=chat_id, from_chat_id=first.chat.id, message_id=first.message_id, reply_markup=kb)
-        except Exception:
-            # fallback: send a short summary
-            text = "Draft saved. Use the buttons below to edit or post."
+        sent_any = False
+        for i, m in enumerate(draft['messages']):
+            # include the control keyboard on the last message sent
+            rm = kb if i == 0 else None
+            try:
+                res = await _attempt_send_preview(client, chat_id, m, reply_markup=rm)
+                if res:
+                    sent_any = True
+            except Exception as e:
+                logger.exception("_attempt_send_preview failed for message: %s", e)
+        if not sent_any:
+            # nothing could be resent, fall back to text summary
+            text = "Draft saved. (preview failed to resend media). Use the buttons below to edit or post."
             if draft.get('url_buttons'):
                 text += f"\nURL buttons: {sum(len(r) for r in draft['url_buttons'])}"
             if draft.get('reactions'):
@@ -258,17 +311,10 @@ async def cb_handler(client, cb):
         kb = InlineKeyboardMarkup(keyboard) if keyboard else None
 
         for i, m in enumerate(draft['messages']):
-            if i == 0:
-                try:
-                    await m.reply_text("Preview:")
-                    await client.copy_message(chat_id=cb.message.chat.id, from_chat_id=m.chat.id, message_id=m.message_id, reply_markup=kb)
-                except Exception:
-                    await m.reply_text("Unable to preview message content.")
-            else:
-                try:
-                    await client.copy_message(chat_id=cb.message.chat.id, from_chat_id=m.chat.id, message_id=m.message_id)
-                except Exception:
-                    pass
+            try:
+                await _attempt_send_preview(client, cb.message.chat.id, m, reply_markup=kb if i == 0 else None)
+            except Exception:
+                logger.exception("_attempt_send_preview failed in preview flow")
         await cb.message.reply_text("This is a preview. Use Post to publish or add more buttons.")
         return
 
@@ -396,11 +442,13 @@ async def cb_handler(client, cb):
         # check bot privileges
         try:
             member = await client.get_chat_member(ch_id, (await client.get_me()).id)
-            if not (str(member.status).lower() in ("administrator", "creator") or getattr(member, 'can_post_messages', False)):
-                await cb.message.reply_text("I am not an admin in that channel. Please make me admin (with right to post/edit) and try again.")
+            member_info = f"status={getattr(member, 'status', None)} can_post_messages={getattr(member, 'can_post_messages', None)}"
+            if not (str(getattr(member, 'status', '')).lower() in ("administrator", "creator") or getattr(member, 'can_post_messages', False)):
+                await cb.message.reply_text(f"I am not an admin in that channel ({member_info}). Please make me admin (with right to post/edit) and try again.")
                 return
-        except Exception:
-            await cb.message.reply_text("Could not verify admin status. Make sure I am a member/admin in that channel.")
+        except Exception as e:
+            logger.exception("Error checking chat member in post_to")
+            await cb.message.reply_text(f"Could not verify admin status due to error: {e}")
             return
         # proceed to post
         await post_draft_to_target(client, uid, ch_id, cb.message.chat.id)
@@ -428,11 +476,14 @@ async def cb_handler(client, cb):
         # verify admin
         try:
             member = await client.get_chat_member(ch_id, (await client.get_me()).id)
-            if not (str(member.status).lower() in ("administrator", "creator") or getattr(member, 'can_post_messages', False)):
-                await ch.reply_text("I am not an admin in that channel. Please make me admin (with right to post/edit) and try again.")
+            member_info = f"status={getattr(member, 'status', None)} can_post_messages={getattr(member, 'can_post_messages', None)}"
+            if not (str(getattr(member, 'status', '')).lower() in ("administrator", "creator") or getattr(member, 'can_post_messages', False)):
+                await ch.reply_text(f"I am not an admin in that channel ({member_info}). Please make me admin (with right to post/edit) and try again.")
                 return
-        except Exception:
-            pass
+        except Exception as e:
+            logger.exception("Error checking chat member in post_custom")
+            await ch.reply_text(f"Could not verify admin status due to error: {e}")
+            return
         await post_draft_to_target(client, uid, ch_id, cb.message.chat.id)
         return
 
@@ -651,8 +702,176 @@ async def list_channels_handler(client, message):
     await message.reply_text(text)
 
 
+@Client.on_message(filters.private & filters.command("diag_channels"))
+async def diag_channels(client, message):
+    """Diagnostic helper: check membership/admin status for configured channels and report details."""
+    uid = message.from_user.id
+    if not is_admin(uid):
+        await message.reply_text("Only owner or admins can run diagnostics.")
+        return
+    channels = await db.list_channels()
+    if not channels:
+        await message.reply_text("No configured channels.")
+        return
+    lines = []
+    me = await client.get_me()
+    for c in channels:
+        ch_id = c.get('_id')
+        try:
+            chinfo = await client.get_chat(ch_id)
+            member = await client.get_chat_member(ch_id, me.id)
+            lines.append(f"{chinfo.title or chinfo.username or ch_id}: status={member.status} can_post={getattr(member,'can_post_messages',None)}")
+        except Exception as e:
+            logger.exception("diag check failed for %s", ch_id)
+            lines.append(f"{ch_id}: error={e}")
+    await message.reply_text("\n".join(lines))
+
+
 @Client.on_message(filters.private & filters.command("create_post"))
 async def create_post_cmd(client, message):
+
+
+@Client.on_message(filters.private & filters.command("send"))
+async def send_cmd(client, message):
+    """Start a send flow: choose channel, collect messages, add buttons/options and send."""
+    uid = message.from_user.id
+    if not is_admin(uid):
+        await message.reply_text("Only owner or admins can send messages.")
+        return
+    DRAFTS[uid] = {'messages': [], 'url_buttons': [], 'reactions': [], 'options': {}, 'target': None}
+
+    channels = await db.list_channels()
+    if not channels:
+        await message.reply_text("No configured channels. Use /add_channel to add one first.")
+        return
+    rows = []
+    for c in channels:
+        ch_id = c.get('_id')
+        label = str(ch_id)
+        try:
+            chinfo = await client.get_chat(ch_id)
+            label = chinfo.title or chinfo.username or str(ch_id)
+        except Exception:
+            pass
+        rows.append([InlineKeyboardButton(label, callback_data=f"send_select|{uid}|{ch_id}")])
+    rows.append([InlineKeyboardButton("Custom channel (enter id)", callback_data=f"send_custom|{uid}")])
+    await message.reply_text("Choose channel to send to:", reply_markup=InlineKeyboardMarkup(rows))
+    return
+
+
+@Client.on_callback_query()
+async def send_cb_handler(client, cb):
+    data = cb.data
+    uid = cb.from_user.id
+
+    if data.startswith("send_select|"):
+        await cb.answer()
+        try:
+            _, _uid, ch_id = data.split("|", 2)
+            ch_id = int(ch_id)
+        except Exception:
+            await cb.message.reply_text("Invalid selection.")
+            return
+        if uid != int(_uid):
+            await cb.answer("This selection is for another user.")
+            return
+        DRAFTS[uid]['target'] = ch_id
+        await cb.message.reply_text("Now send one or multiple messages you want to post. Send /done when finished or /cancel to abort.")
+        messages = []
+        while True:
+            try:
+                m = await client.listen(cb.message.chat.id, timeout=300)
+            except asyncio.TimeoutError:
+                await cb.message.reply_text("Timed out collecting messages. Use /send to start again.")
+                DRAFTS.pop(uid, None)
+                return
+            if m.text and m.text.lower() == "/cancel":
+                DRAFTS.pop(uid, None)
+                await m.reply_text("Cancelled.")
+                return
+            if m.text and m.text.lower() == "/done":
+                break
+            messages.append(m)
+        if not messages:
+            await cb.message.reply_text("No messages collected. Aborting.")
+            DRAFTS.pop(uid, None)
+            return
+        DRAFTS[uid]['messages'] = messages
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Add URL Buttons", callback_data=f"add_url|{uid}"), InlineKeyboardButton("Preview", callback_data=f"preview_draft|{uid}")],
+            [InlineKeyboardButton("Send Now", callback_data=f"send_now|{uid}")],
+            [InlineKeyboardButton("Cancel", callback_data=f"cancel_post|{uid}")]
+        ])
+        await cb.message.reply_text("Messages saved. Choose action:", reply_markup=kb)
+        return
+
+    if data.startswith("send_custom|"):
+        await cb.answer()
+        if "|" in data:
+            _, _uid = data.split("|", 1)
+            uid = int(_uid)
+        await cb.message.reply_text("Send the channel username (eg @channelusername) or channel ID (eg -10012345) to send to.")
+        try:
+            ch = await client.listen(cb.message.chat.id, timeout=300)
+        except asyncio.TimeoutError:
+            await cb.message.reply_text("Timed out.")
+            return
+        if ch.text and ch.text.lower() == "/cancel":
+            await ch.reply_text("Cancelled.")
+            return
+        try:
+            target = await client.get_chat(ch.text.strip())
+        except Exception:
+            await ch.reply_text("Could not find that channel.")
+            return
+        DRAFTS[uid]['target'] = target.id
+        await ch.reply_text("Now send one or multiple messages you want to post. Send /done when finished or /cancel to abort.")
+        messages = []
+        while True:
+            try:
+                m = await client.listen(ch.chat.id, timeout=300)
+            except asyncio.TimeoutError:
+                await ch.reply_text("Timed out collecting messages. Use /send to start again.")
+                DRAFTS.pop(uid, None)
+                return
+            if m.text and m.text.lower() == "/cancel":
+                DRAFTS.pop(uid, None)
+                await m.reply_text("Cancelled.")
+                return
+            if m.text and m.text.lower() == "/done":
+                break
+            messages.append(m)
+        if not messages:
+            await ch.reply_text("No messages collected. Aborting.")
+            DRAFTS.pop(uid, None)
+            return
+        DRAFTS[uid]['messages'] = messages
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Add URL Buttons", callback_data=f"add_url|{uid}"), InlineKeyboardButton("Preview", callback_data=f"preview_draft|{uid}")],
+            [InlineKeyboardButton("Send Now", callback_data=f"send_now|{uid}")],
+            [InlineKeyboardButton("Cancel", callback_data=f"cancel_post|{uid}")]
+        ])
+        await ch.reply_text("Messages saved. Choose action:", reply_markup=kb)
+        return
+
+    if data.startswith("send_now|"):
+        await cb.answer()
+        _, _uid = data.split("|", 1)
+        uid = int(_uid)
+        if uid not in DRAFTS:
+            await cb.message.reply_text("No active draft.")
+            return
+        # reuse posting logic (same as publishing from drafts)
+        draft = DRAFTS[uid]
+        target = draft.get('target')
+        if not target:
+            await cb.message.reply_text("No target channel. Start again.")
+            return
+        # delegate to post helper which copies messages, adds url/reaction buttons and persists counts
+        await post_draft_to_target(client, uid, target, cb.message.chat.id)
+        return
+
+
     uid = message.from_user.id
     if not is_admin(uid):
         await message.reply_text("Only owner or admins can create posts.")
