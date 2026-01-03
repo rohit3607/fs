@@ -26,6 +26,10 @@ class Rohit:
         self.channels = self.database['channels']
         # Posts metadata for reaction tracking
         self.posts = self.database['posts']
+        # persisted templates, channel-specific admin list/settings
+        self.templates = self.database['templates']
+        self.channel_admins = self.database['channel_admins']
+        self.channel_settings = self.database['channel_settings']
 
     # USER DATA
     async def present_user(self, user_id: int):
@@ -82,6 +86,51 @@ class Rohit:
         if result:
             return result.get('reactions', {}).get(emoji, 0)
         return 0
+
+    # Scheduled posts
+
+
+    # Templates
+    async def add_template(self, owner: int, name: str, content: str):
+        await self.templates.update_one({'owner': owner, 'name': name}, {'$set': {'content': content, 'updated_at': datetime.utcnow()}}, upsert=True)
+        return
+
+    async def list_templates(self, owner: int):
+        docs = await self.templates.find({'owner': owner}).to_list(length=None)
+        return docs
+
+    async def get_template(self, owner: int, name: str):
+        return await self.templates.find_one({'owner': owner, 'name': name})
+
+    async def remove_template(self, owner: int, name: str):
+        await self.templates.delete_one({'owner': owner, 'name': name})
+        return
+
+    # Channel admins & settings
+    async def add_channel_admin(self, channel_id: int, user_id: int):
+        await self.channel_admins.update_one({'channel_id': channel_id}, {'$addToSet': {'admins': user_id}}, upsert=True)
+        return
+
+    async def remove_channel_admin(self, channel_id: int, user_id: int):
+        await self.channel_admins.update_one({'channel_id': channel_id}, {'$pull': {'admins': user_id}})
+        return
+
+    async def list_channel_admins(self, channel_id: int):
+        doc = await self.channel_admins.find_one({'channel_id': channel_id})
+        return doc.get('admins', []) if doc else []
+
+    async def set_channel_setting(self, channel_id: int, key: str, value):
+        await self.channel_settings.update_one({'_id': channel_id}, {'$set': {key: value}}, upsert=True)
+        return
+
+    async def get_channel_setting(self, channel_id: int, key: str, default=None):
+        doc = await self.channel_settings.find_one({'_id': channel_id})
+        if not doc:
+            return default
+        return doc.get(key, default)
+
+
+
 
 
 
