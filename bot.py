@@ -33,6 +33,14 @@ logging.getLogger("apscheduler").setLevel(logging.WARNING)
 name ="""
  BY CODEFLIX BOTS
 """
+from aiohttp import web
+
+routes = web.RouteTableDef()
+
+@routes.get("/", allow_head=True)
+async def root_route_handler(request):
+    return web.json_response("Codeflix FileStore")
+
 
 def get_indian_time():
     """Returns the current time in IST."""
