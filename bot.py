@@ -22,26 +22,12 @@ import pytz
 from datetime import datetime
 #rohit_1888 on Tg
 from config import *
-from database.db_premium import *
 from database.database import *
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import logging
 
 # Suppress APScheduler logs below WARNING level
 logging.getLogger("apscheduler").setLevel(logging.WARNING)
-
-scheduler = AsyncIOScheduler(timezone="Asia/Kolkata")
-scheduler.add_job(remove_expired_users, "interval", seconds=10)
-
-# Reset verify count for all users daily at 00:00 IST
-async def daily_reset_task():
-    try:
-        await db.reset_all_verify_counts()
-    except Exception:
-        pass  
-
-scheduler.add_job(daily_reset_task, "cron", hour=0, minute=0)
-#scheduler.start()
 
 
 name ="""
@@ -69,20 +55,9 @@ class Bot(Client):
 
     async def start(self):
         await super().start()
-        scheduler.start()
         usr_bot_me = await self.get_me()
         self.uptime = datetime.now()
 
-        try:
-            db_channel = await self.get_chat(CHANNEL_ID)
-            self.db_channel = db_channel
-            test = await self.send_message(chat_id = db_channel.id, text = "Test Message")
-            await test.delete()
-        except Exception as e:
-            self.LOGGER(__name__).warning(e)
-            self.LOGGER(__name__).warning(f"Make Sure bot is Admin in DB Channel, and Double check the CHANNEL_ID Value, Current Value {CHANNEL_ID}")
-            self.LOGGER(__name__).info("\nBot Stopped. Join https://t.me/weebs_support for support")
-            sys.exit()
 
         self.set_parse_mode(ParseMode.HTML)
         self.LOGGER(__name__).info(f"Bot Running..!\n\nCreated by \nhttps://t.me/weebs_support")
