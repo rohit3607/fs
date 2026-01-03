@@ -42,3 +42,5 @@ class Rohit:
         return
 
 
+
+db = Rohit(DB_URI, DB_NAME)
